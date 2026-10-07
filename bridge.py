@@ -6,49 +6,49 @@ import time
 import aiohttp
 
 ### ----------------- CONFIGURATION FROM ENV -----------------
-HUB_URL = os.getenv("HUB_URL", "http://192.168.1.128:5171/api")[cite: 8]
-TRACCAR_URL = os.getenv("TRACCAR_URL", "http://192.168.1.128:5055")[cite: 8]
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2.0"))[cite: 8]
-CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "30"))[cite: 8]
+HUB_URL = os.getenv("HUB_URL", "http://192.168.1.128:5171/api")
+TRACCAR_URL = os.getenv("TRACCAR_URL", "http://192.168.1.128:5055")
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2.0"))
+CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "30"))
 
 # Default fallback coordinates (Kununurra, WA)
 DEFAULT_LAT = float(os.getenv("DEFAULT_LAT", "-15.7736"))
 DEFAULT_LON = float(os.getenv("DEFAULT_LON", "128.7386"))
 ### ----------------------------------------------------------
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")[cite: 8]
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # Decimal PID mapping: (Attribute Name, Multiplier)
 PID_MAP = {
     # Standard OBD-II Mode 01
     260: ("engineLoad", 1),       # 0x104 (%)
-    261: ("coolantTemp", 1),      # 0x105 (°C)[cite: 8, 17]
+    261: ("coolantTemp", 1),      # 0x105 (°C)
     266: ("fuelPressure", 1),     # 0x10A (kPa)
-    267: ("intakePressure", 1),   # 0x10B (MAP kPa)[cite: 17]
-    268: ("rpm", 1),              # 0x10C (RPM)[cite: 8, 17]
-    269: ("obdSpeed", 1),         # 0x10D (km/h)[cite: 8, 17]
-    270: ("timingAdvance", 1),    # 0x10E (deg)[cite: 8, 17]
-    271: ("intakeTemp", 1),       # 0x10F (°C)[cite: 8, 17]
-    272: ("maf", 1),              # 0x110 (g/s)[cite: 17]
-    273: ("throttle", 1),         # 0x111 (%)[cite: 8, 17]
-    287: ("runtime", 1),          # 0x11F (s)[cite: 17]
-    289: ("distanceMil", 1),      # 0x121 (km)[cite: 17]
-    303: ("fuelLevel", 1),        # 0x12F (%)[cite: 8, 17]
-    305: ("distanceCleared", 1),  # 0x131 (km)[cite: 17]
-    307: ("barometer", 1),        # 0x133 (kPa)[cite: 17]
-    322: ("ecuVoltage", 1),       # 0x142 (V)[cite: 17]
-    323: ("absoluteLoad", 1),     # 0x143 (%)[cite: 17]
-    348: ("oilTemp", 1),          # 0x15C (°C)[cite: 17]
-    350: ("fuelRate", 1),         # 0x15E (L/h)[cite: 17]
+    267: ("intakePressure", 1),   # 0x10B (MAP kPa)
+    268: ("rpm", 1),              # 0x10C (RPM)
+    269: ("obdSpeed", 1),         # 0x10D (km/h)
+    270: ("timingAdvance", 1),    # 0x10E (deg)
+    271: ("intakeTemp", 1),       # 0x10F (°C)
+    272: ("maf", 1),              # 0x110 (g/s)
+    273: ("throttle", 1),         # 0x111 (%)
+    287: ("runtime", 1),          # 0x11F (s)
+    289: ("distanceMil", 1),      # 0x121 (km)
+    303: ("fuelLevel", 1),        # 0x12F (%)
+    305: ("distanceCleared", 1),  # 0x131 (km)
+    307: ("barometer", 1),        # 0x133 (kPa)
+    322: ("ecuVoltage", 1),       # 0x142 (V)
+    323: ("absoluteLoad", 1),     # 0x143 (%)
+    348: ("oilTemp", 1),          # 0x15C (°C)
+    350: ("fuelRate", 1),         # 0x15E (L/h)
 
     # Freematics Hardware & GPS Sensors
-    10:  ("lat", 1),              # 0x0A Latitude[cite: 17]
-    11:  ("lon", 1),              # 0x0B Longitude[cite: 17]
-    12:  ("altitude", 1),         # 0x0C Altitude (m)[cite: 17]
-    13:  ("raw_speed", 1),        # 0x0D GPS Speed (km/h)[cite: 17]
-    36:  ("battery", 0.01),       # 0x24 Battery voltage (0.01V -> V)[cite: 8, 17]
-    129: ("rssi", 1),             # 0x81 Signal strength (dBm)[cite: 17]
-    130: ("devTemp", 0.1),        # 0x82 CPU temp (0.1°C -> °C)[cite: 8, 17]
+    10:  ("lat", 1),              # 0x0A Latitude
+    11:  ("lon", 1),              # 0x0B Longitude
+    12:  ("altitude", 1),         # 0x0C Altitude (m)
+    13:  ("raw_speed", 1),        # 0x0D GPS Speed (km/h)
+    36:  ("battery", 0.01),       # 0x24 Battery voltage (0.01V -> V)
+    129: ("rssi", 1),             # 0x81 Signal strength (dBm)
+    130: ("devTemp", 0.1),        # 0x82 CPU temp (0.1°C -> °C)
 }
 
 device_last_devtick = {}
@@ -67,10 +67,10 @@ def clean_value(val):
 
 async def push_to_traccar(session, sem, params):
     """Send OsmAnd formatted GET request to Traccar."""
-    async with sem:[cite: 8]
+    async with sem:
         try:
-            async with session.get(TRACCAR_URL, params=params, timeout=aiohttp.ClientTimeout(total=2)) as resp:[cite: 8]
-                return resp.status == 200[cite: 8]
+            async with session.get(TRACCAR_URL, params=params, timeout=aiohttp.ClientTimeout(total=2)) as resp:
+                return resp.status == 200
         except Exception as e:
             logging.error(f"Failed to connect to Traccar: {e}")
             return False
@@ -98,7 +98,7 @@ async def process_channel(session, sem, ch_summary):
 
     params = {
         "id": device_id,
-        "timestamp": int(time.time()),[cite: 8]
+        "timestamp": int(time.time()),
     }
 
     # 2. Parse the [[pid, value, age], ...] data array
@@ -122,8 +122,8 @@ async def process_channel(session, sem, ch_summary):
     if "alt" in params and "altitude" not in params:
         params["altitude"] = clean_value(params.pop("alt"))
 
-    # 4. Speed Conversion: Traccar OsmAnd protocol expects speed in KNOTS
-    # 1 knot = 1.852 km/h (dividing by 1.852 ensures Traccar's UI converts back to exact km/h)
+    # 4. Speed Conversion: Traccar OsmAnd protocol expects speed in knots
+    # 1 knot = 1.852 km/h
     speed_kmh = params.get("obdSpeed", params.get("raw_speed", 0))
     try:
         params["speed"] = round(float(speed_kmh) / 1.852, 2)
@@ -175,27 +175,27 @@ async def process_channel(session, sem, ch_summary):
         )
 
 async def main():
-    logging.info(f"Starting Bridge -> Hub: {HUB_URL} | Traccar: {TRACCAR_URL}")[cite: 8]
+    logging.info(f"Starting Bridge -> Hub: {HUB_URL} | Traccar: {TRACCAR_URL}")
     logging.info(f"Default fallback location: {DEFAULT_LAT}, {DEFAULT_LON}")
-    sem = asyncio.Semaphore(CONCURRENCY_LIMIT)[cite: 8]
-    conn = aiohttp.TCPConnector(limit=100, limit_per_host=50)[cite: 8]
+    sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
+    conn = aiohttp.TCPConnector(limit=100, limit_per_host=50)
 
-    async with aiohttp.ClientSession(connector=conn) as session:[cite: 8]
-        while True:[cite: 8]
-            start_loop = time.monotonic()[cite: 8]
+    async with aiohttp.ClientSession(connector=conn) as session:
+        while True:
+            start_loop = time.monotonic()
             try:
-                async with session.get(f"{HUB_URL}/channels", timeout=aiohttp.ClientTimeout(total=3)) as resp:[cite: 8]
-                    if resp.status == 200:[cite: 8]
-                        payload = await resp.json()[cite: 8]
+                async with session.get(f"{HUB_URL}/channels", timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                    if resp.status == 200:
+                        payload = await resp.json()
                         channels = payload.get("channels", []) if isinstance(payload, dict) else payload
                         tasks = [process_channel(session, sem, ch) for ch in channels if isinstance(ch, dict)]
-                        if tasks:[cite: 8]
-                            await asyncio.gather(*tasks)[cite: 8]
+                        if tasks:
+                            await asyncio.gather(*tasks)
             except Exception as e:
-                logging.warning(f"Error reading Hub channels: {e}")[cite: 8]
+                logging.warning(f"Error reading Hub channels: {e}")
 
-            elapsed = time.monotonic() - start_loop[cite: 8]
-            await asyncio.sleep(max(0.1, POLL_INTERVAL - elapsed))[cite: 8]
+            elapsed = time.monotonic() - start_loop
+            await asyncio.sleep(max(0.1, POLL_INTERVAL - elapsed))
 
 if __name__ == "__main__":
-    asyncio.run(main())[cite: 8]
+    asyncio.run(main())
