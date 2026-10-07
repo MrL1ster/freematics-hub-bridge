@@ -101,6 +101,18 @@ async def main():
     sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
     conn = aiohttp.TCPConnector(limit=100, limit_per_host=50)
 
+    async with session.get(f"{HUB_URL}/channels", timeout=aiohttp.ClientTimeout(total=3)) as resp:
+    if resp.status == 200:
+        payload = await resp.json()
+        # Unpack the "channels" array returned by Freematics Hub
+        channels = payload.get("channels", []) if isinstance(payload, dict) else payload
+        tasks = []
+        for ch in channels:
+            dev_id = ch.get("devid", ch.get("id"))
+            tasks.append(process_device(session, sem, dev_id, ch))
+        if tasks:
+            await asyncio.gather(*tasks)
+
     async with aiohttp.ClientSession(connector=conn) as session:
         while True:
             start_loop = time.monotonic()
