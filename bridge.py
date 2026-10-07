@@ -47,7 +47,7 @@ async def process_device(session, sem, device_id, dev_data):
     if not isinstance(dev_data, dict):
         return
 
-    current_time = dev_data.get("time", int(time.time()))
+    current_time = dev_data.get("time", dev_data.get("tick", int(time.time())))
     if device_timestamps.get(device_id) == current_time:
         return
 
@@ -56,15 +56,12 @@ async def process_device(session, sem, device_id, dev_data):
     lon = dev_data.get("lon")
 
     if lat is not None and lon is not None:
-        # Live satellite lock acquired -> update cached location
         device_locations[device_id] = (lat, lon)
         fix_type = "live GPS"
     elif device_id in device_locations:
-        # Fall back to previously recorded position
         lat, lon = device_locations[device_id]
         fix_type = "last-known GPS"
     else:
-        # Never locked -> default to Kununurra, WA
         lat, lon = DEFAULT_LAT, DEFAULT_LON
         fix_type = "default fallback (Kununurra)"
 
@@ -95,42 +92,52 @@ async def process_device(session, sem, device_id, dev_data):
     else:
         logging.warning(f"[{device_id}] Traccar rejected update (HTTP non-200)")
 
+async def handle_channel(session, sem, ch):
+    ch_id = ch.get("id")
+    dev_id = ch.get("devid", ch_id)
+
+    # If telemetry stats are not in the summary channel object, fetch detailed channel data
+    if "stats" not in ch and "pids" not in ch and "lat" not in ch and ch_id:
+        try:
+            async with session.get(f"{HUB_URL}/channels/{ch_id}", timeout=aiohttp.ClientTimeout(total=2)) as resp:
+                if resp.status == 200:
+                    detail = await resp.json()
+                    if isinstance(detail, dict):
+                        ch = {**ch, **detail}
+        except Exception as e:
+            logging.debug(f"Could not fetch details for channel {ch_id}: {e}")
+
+    await process_device(session, sem, dev_id, ch)
+
 async def main():
     logging.info(f"Starting Bridge -> Hub: {HUB_URL} | Traccar: {TRACCAR_URL}")
     logging.info(f"Default fallback location: {DEFAULT_LAT}, {DEFAULT_LON}")
     sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
     conn = aiohttp.TCPConnector(limit=100, limit_per_host=50)
 
-    async with session.get(f"{HUB_URL}/channels", timeout=aiohttp.ClientTimeout(total=3)) as resp:
-    if resp.status == 200:
-        payload = await resp.json()
-        # Unpack the "channels" array returned by Freematics Hub
-        channels = payload.get("channels", []) if isinstance(payload, dict) else payload
-        tasks = []
-        for ch in channels:
-            dev_id = ch.get("devid", ch.get("id"))
-            tasks.append(process_device(session, sem, dev_id, ch))
-        if tasks:
-            await asyncio.gather(*tasks)
-
     async with aiohttp.ClientSession(connector=conn) as session:
         while True:
             start_loop = time.monotonic()
-            all_devices = {}
             try:
                 async with session.get(f"{HUB_URL}/channels", timeout=aiohttp.ClientTimeout(total=3)) as resp:
                     if resp.status == 200:
-                        all_devices = await resp.json()
+                        payload = await resp.json()
+                        raw_channels = payload.get("channels", []) if isinstance(payload, dict) else payload
+
+                        tasks = []
+                        if isinstance(raw_channels, list):
+                            for ch in raw_channels:
+                                if isinstance(ch, dict):
+                                    tasks.append(handle_channel(session, sem, ch))
+                        elif isinstance(payload, dict):
+                            for dev_id, data in payload.items():
+                                if dev_id != "channels" and isinstance(data, dict):
+                                    tasks.append(process_device(session, sem, dev_id, data))
+
+                        if tasks:
+                            await asyncio.gather(*tasks)
             except Exception as e:
                 logging.warning(f"Error reading Hub channels: {e}")
-
-            if isinstance(all_devices, dict):
-                tasks = [
-                    process_device(session, sem, dev_id, data)
-                    for dev_id, data in all_devices.items()
-                ]
-                if tasks:
-                    await asyncio.gather(*tasks)
 
             elapsed = time.monotonic() - start_loop
             sleep_time = max(0.1, POLL_INTERVAL - elapsed)
