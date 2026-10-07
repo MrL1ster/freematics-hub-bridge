@@ -5,12 +5,16 @@ import os
 import time
 import aiohttp
 
-# ----------------- CONFIGURATION FROM ENV -----------------
-HUB_URL = os.getenv("HUB_URL", "http://192.168.1.128:8080/hub/api")
+### ----------------- CONFIGURATION FROM ENV -----------------
+HUB_URL = os.getenv("HUB_URL", "http://192.168.1.128:5171/api")
 TRACCAR_URL = os.getenv("TRACCAR_URL", "http://192.168.1.128:5055")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2.0"))
 CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "30"))
-# ----------------------------------------------------------
+
+# Default fallback coordinates (Kununurra, WA)
+DEFAULT_LAT = float(os.getenv("DEFAULT_LAT", "-15.7736"))
+DEFAULT_LON = float(os.getenv("DEFAULT_LON", "128.7386"))
+### ----------------------------------------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -28,27 +32,41 @@ PID_MAP = {
 }
 
 device_timestamps = {}
+device_locations = {}  # Stores last known GPS fix: {device_id: (lat, lon)}
 
 async def push_to_traccar(session, sem, params):
     async with sem:
         try:
             async with session.get(TRACCAR_URL, params=params, timeout=aiohttp.ClientTimeout(total=2)) as resp:
                 return resp.status == 200
-        except Exception:
+        except Exception as e:
+            logging.error(f"Failed to connect to Traccar: {e}")
             return False
 
 async def process_device(session, sem, device_id, dev_data):
     if not isinstance(dev_data, dict):
         return
 
-    lat = dev_data.get("lat")
-    lon = dev_data.get("lon")
-    if lat is None or lon is None:
-        return
-
     current_time = dev_data.get("time", int(time.time()))
     if device_timestamps.get(device_id) == current_time:
         return
+
+    # Evaluate GPS fix and fallback logic
+    lat = dev_data.get("lat")
+    lon = dev_data.get("lon")
+
+    if lat is not None and lon is not None:
+        # Live satellite lock acquired -> update cached location
+        device_locations[device_id] = (lat, lon)
+        fix_type = "live GPS"
+    elif device_id in device_locations:
+        # Fall back to previously recorded position
+        lat, lon = device_locations[device_id]
+        fix_type = "last-known GPS"
+    else:
+        # Never locked -> default to Kununurra, WA
+        lat, lon = DEFAULT_LAT, DEFAULT_LON
+        fix_type = "default fallback (Kununurra)"
 
     params = {
         "id": device_id,
@@ -73,9 +91,13 @@ async def process_device(session, sem, device_id, dev_data):
     success = await push_to_traccar(session, sem, params)
     if success:
         device_timestamps[device_id] = current_time
+        logging.info(f"[{device_id}] Pushed to Traccar using {fix_type} ({lat}, {lon})")
+    else:
+        logging.warning(f"[{device_id}] Traccar rejected update (HTTP non-200)")
 
 async def main():
     logging.info(f"Starting Bridge -> Hub: {HUB_URL} | Traccar: {TRACCAR_URL}")
+    logging.info(f"Default fallback location: {DEFAULT_LAT}, {DEFAULT_LON}")
     sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
     conn = aiohttp.TCPConnector(limit=100, limit_per_host=50)
 
