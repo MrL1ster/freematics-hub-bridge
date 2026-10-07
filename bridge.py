@@ -10,16 +10,14 @@ TRACCAR_URL = os.getenv("TRACCAR_URL", "http://192.168.1.128:5055")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2.0"))
 CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "30"))
 
-# Maximum age of data (in seconds) to consider active before treating as standby
-MAX_DATA_AGE_SEC = float(os.getenv("MAX_DATA_AGE_SEC", "15.0"))
-
 DEFAULT_LAT = float(os.getenv("DEFAULT_LAT", "-15.7736"))
 DEFAULT_LON = float(os.getenv("DEFAULT_LON", "128.7386"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+# Decimal PID mapping: (Attribute Name, Multiplier)
 PID_MAP = {
-    # OBD-II Mode 01
+    # Mode 01 PIDs
     260: ("engineLoad", 1),       # 0x104 (%)
     261: ("coolantTemp", 1),      # 0x105 (°C)
     266: ("fuelPressure", 1),     # 0x10A (kPa)
@@ -39,9 +37,9 @@ PID_MAP = {
     11:  ("lon", 1),              # 0x0B Longitude
     12:  ("alt", 1),              # 0x0C Altitude
     13:  ("speed", 1),            # 0x0D Speed
-    36:  ("battery", 0.01),       # 0x24 Battery voltage (0.01V)
+    36:  ("battery", 0.01),       # 0x24 Battery voltage (0.01V -> V)
     129: ("rssi", 1),             # 0x81 Signal strength (dBm)
-    130: ("devTemp", 0.1),        # 0x82 CPU temp (0.1°C)
+    130: ("devTemp", 0.1),        # 0x82 CPU temp (0.1°C -> °C)
 }
 
 device_last_devtick = {}
@@ -57,30 +55,25 @@ async def push_to_traccar(session, sem, params):
             return False
 
 async def process_channel(session, sem, ch_summary):
-    ch_id = ch_summary.get("id")
-    device_id = ch_summary.get("devid", ch_id)
-
-    # 1. Standby Check via Hardware Devtick
-    devtick = ch_summary.get("devtick")
-    if devtick is not None:
-        if device_last_devtick.get(device_id) == devtick:
-            # Device has not transmitted any new data; in standby or parked
-            return
-
-    # 2. Standby Check via Data Age (ms since last hardware reception)
-    age_ms = ch_summary.get("age", {}).get("data", 0)
-    if age_ms > (MAX_DATA_AGE_SEC * 1000):
-        # Data is older than threshold; device is asleep
+    device_id = ch_summary.get("devid", ch_summary.get("id"))
+    if not device_id:
         return
 
-    # Fetch detailed telemetry
+    # 1. Fetch live telemetry from /api/get/<device_id>
     telemetry = {}
     try:
-        async with session.get(f"{HUB_URL}/get/{ch_id}", timeout=aiohttp.ClientTimeout(total=2)) as resp:
+        async with session.get(f"{HUB_URL}/get/{device_id}", timeout=aiohttp.ClientTimeout(total=2)) as resp:
             if resp.status == 200:
                 telemetry = await resp.json()
     except Exception as e:
-        logging.debug(f"Error fetching /api/get/{ch_id}: {e}")
+        logging.debug(f"Error fetching /api/get/{device_id}: {e}")
+
+    stats = telemetry.get("stats", {})
+    devtick = stats.get("devtick", ch_summary.get("devtick"))
+
+    # Skip push if the hardware tick has not changed (device in standby)
+    if devtick is not None and device_last_devtick.get(device_id) == devtick:
+        return
 
     params = {
         "id": device_id,
@@ -89,6 +82,7 @@ async def process_channel(session, sem, ch_summary):
         "altitude": 0,
     }
 
+    # 2. Parse the [[pid, value, age], ...] data array
     raw_data = telemetry.get("data", [])
     for entry in raw_data:
         if not isinstance(entry, (list, tuple)) or len(entry) < 2:
@@ -120,7 +114,7 @@ async def process_channel(session, sem, ch_summary):
     if success:
         if devtick is not None:
             device_last_devtick[device_id] = devtick
-        logging.info(f"[{device_id}] Pushed live update to Traccar (devtick: {devtick})")
+        logging.info(f"[{device_id}] Pushed to Traccar: {fix_type} | Attributes: {list(params.keys())}")
 
 async def main():
     logging.info(f"Starting Bridge -> Hub: {HUB_URL} | Traccar: {TRACCAR_URL}")
