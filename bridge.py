@@ -5,34 +5,45 @@ import os
 import time
 import aiohttp
 
-### ----------------- CONFIGURATION FROM ENV -----------------
 HUB_URL = os.getenv("HUB_URL", "http://192.168.1.128:5171/api")
 TRACCAR_URL = os.getenv("TRACCAR_URL", "http://192.168.1.128:5055")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2.0"))
 CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "30"))
 
-# Default fallback coordinates (Kununurra, WA)
 DEFAULT_LAT = float(os.getenv("DEFAULT_LAT", "-15.7736"))
 DEFAULT_LON = float(os.getenv("DEFAULT_LON", "128.7386"))
-### ----------------------------------------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+# Decimal PID mapping: (Attribute Name, Multiplier)
 PID_MAP = {
-    0x10C: "rpm",
-    0x10D: "obdSpeed",
-    0x104: "engineLoad",
-    0x105: "coolantTemp",
-    0x10F: "intakeTemp",
-    0x111: "throttle",
-    0x12F: "fuelLevel",
-    0x10E: "timingAdvance",
-    0x24:  "battery",
-    0x82:  "devTemp",
+    # OBD-II Mode 01
+    260: ("engineLoad", 1),       # 0x104 (%)
+    261: ("coolantTemp", 1),      # 0x105 (°C)
+    266: ("fuelPressure", 1),     # 0x10A (kPa)
+    267: ("intakePressure", 1),   # 0x10B (MAP kPa)
+    268: ("rpm", 1),              # 0x10C (RPM)
+    269: ("obdSpeed", 1),         # 0x10D (km/h)
+    270: ("timingAdvance", 1),    # 0x10E (deg)
+    271: ("intakeTemp", 1),       # 0x10F (°C)
+    272: ("maf", 1),              # 0x110 (g/s)
+    273: ("throttle", 1),         # 0x111 (%)
+    287: ("runtime", 1),          # 0x11F (s)
+    303: ("fuelLevel", 1),        # 0x12F (%)
+    322: ("ecuVoltage", 1),       # 0x142 (V)
+    348: ("oilTemp", 1),          # 0x15C (°C)
+    # Freematics Custom Sensors
+    10:  ("lat", 1),              # 0x0A Latitude
+    11:  ("lon", 1),              # 0x0B Longitude
+    12:  ("alt", 1),              # 0x0C Altitude
+    13:  ("speed", 1),            # 0x0D Speed
+    36:  ("battery", 0.01),       # 0x24 Battery voltage (403 -> 4.03V)
+    129: ("rssi", 1),             # 0x81 Signal strength (dBm)
+    130: ("devTemp", 0.1),        # 0x82 CPU temp (41 -> 4.1°C)
 }
 
 device_timestamps = {}
-device_locations = {}  # Stores last known GPS fix: {device_id: (lat, lon)}
+device_locations = {}
 
 async def push_to_traccar(session, sem, params):
     async with sem:
@@ -43,75 +54,69 @@ async def push_to_traccar(session, sem, params):
             logging.error(f"Failed to connect to Traccar: {e}")
             return False
 
-async def process_device(session, sem, device_id, dev_data):
-    if not isinstance(dev_data, dict):
-        return
+async def process_channel(session, sem, ch_summary):
+    ch_id = ch_summary.get("id")
+    # Use devid if present, else fallback to channel id
+    device_id = ch_summary.get("devid", ch_id)
 
-    current_time = dev_data.get("time", dev_data.get("tick", int(time.time())))
+    # Fetch instant telemetry containing raw PIDs
+    telemetry = {}
+    try:
+        async with session.get(f"{HUB_URL}/get/{ch_id}", timeout=aiohttp.ClientTimeout(total=2)) as resp:
+            if resp.status == 200:
+                telemetry = await resp.json()
+    except Exception as e:
+        logging.debug(f"Error fetching /api/get/{ch_id}: {e}")
+
+    stats = telemetry.get("stats", {})
+    current_time = stats.get("devtick", stats.get("tick", int(time.time())))
     if device_timestamps.get(device_id) == current_time:
         return
 
-    # Evaluate GPS fix and fallback logic
-    lat = dev_data.get("lat")
-    lon = dev_data.get("lon")
+    params = {
+        "id": device_id,
+        "timestamp": current_time,
+        "speed": 0,
+        "altitude": 0,
+    }
 
+    # Parse the data array: [[pid, value, age], ...]
+    raw_data = telemetry.get("data", [])
+    for entry in raw_data:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        pid = entry[0]
+        val = entry[1]
+
+        if pid in PID_MAP:
+            name, scale = PID_MAP[pid]
+            if scale != 1 and isinstance(val, (int, float)):
+                params[name] = round(val * scale, 2)
+            else:
+                params[name] = val
+        else:
+            params[f"pid_{pid}"] = val
+
+    # GPS coordinates handling
+    lat = params.get("lat")
+    lon = params.get("lon")
     if lat is not None and lon is not None:
         device_locations[device_id] = (lat, lon)
         fix_type = "live GPS"
     elif device_id in device_locations:
-        lat, lon = device_locations[device_id]
+        params["lat"], params["lon"] = device_locations[device_id]
         fix_type = "last-known GPS"
     else:
-        lat, lon = DEFAULT_LAT, DEFAULT_LON
+        params["lat"], params["lon"] = DEFAULT_LAT, DEFAULT_LON
         fix_type = "default fallback (Kununurra)"
-
-    params = {
-        "id": device_id,
-        "lat": lat,
-        "lon": lon,
-        "timestamp": current_time,
-        "speed": dev_data.get("speed", 0),
-        "altitude": dev_data.get("alt", 0),
-    }
-
-    stats = dev_data.get("stats", {}) or dev_data.get("pids", {})
-    for pid_key, val in stats.items():
-        try:
-            pid_int = int(pid_key, 16) if isinstance(pid_key, str) and pid_key.startswith("0x") else int(pid_key)
-            if pid_int in PID_MAP:
-                params[PID_MAP[pid_int]] = val
-            else:
-                params[f"pid_{hex(pid_int)}"] = val
-        except (ValueError, TypeError):
-            continue
 
     success = await push_to_traccar(session, sem, params)
     if success:
         device_timestamps[device_id] = current_time
-        logging.info(f"[{device_id}] Pushed to Traccar using {fix_type} ({lat}, {lon})")
-    else:
-        logging.warning(f"[{device_id}] Traccar rejected update (HTTP non-200)")
-
-async def handle_channel(session, sem, ch):
-    ch_id = ch.get("id")
-    dev_id = ch.get("devid", ch_id)
-
-    # If telemetry stats are not in the summary channel object, fetch detailed channel data
-    if "stats" not in ch and "pids" not in ch and "lat" not in ch and ch_id:
-        try:
-            async with session.get(f"{HUB_URL}/channels/{ch_id}", timeout=aiohttp.ClientTimeout(total=2)) as resp:
-                if resp.status == 200:
-                    detail = await resp.json()
-                    if isinstance(detail, dict):
-                        ch = {**ch, **detail}
-        except Exception as e:
-            logging.debug(f"Could not fetch details for channel {ch_id}: {e}")
-
-    await process_device(session, sem, dev_id, ch)
+        logging.info(f"[{device_id}] Pushed to Traccar: {fix_type} | Attributes: {list(params.keys())}")
 
 async def main():
     logging.info(f"Starting Bridge -> Hub: {HUB_URL} | Traccar: {TRACCAR_URL}")
-    logging.info(f"Default fallback location: {DEFAULT_LAT}, {DEFAULT_LON}")
     sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
     conn = aiohttp.TCPConnector(limit=100, limit_per_host=50)
 
@@ -122,26 +127,15 @@ async def main():
                 async with session.get(f"{HUB_URL}/channels", timeout=aiohttp.ClientTimeout(total=3)) as resp:
                     if resp.status == 200:
                         payload = await resp.json()
-                        raw_channels = payload.get("channels", []) if isinstance(payload, dict) else payload
-
-                        tasks = []
-                        if isinstance(raw_channels, list):
-                            for ch in raw_channels:
-                                if isinstance(ch, dict):
-                                    tasks.append(handle_channel(session, sem, ch))
-                        elif isinstance(payload, dict):
-                            for dev_id, data in payload.items():
-                                if dev_id != "channels" and isinstance(data, dict):
-                                    tasks.append(process_device(session, sem, dev_id, data))
-
+                        channels = payload.get("channels", []) if isinstance(payload, dict) else payload
+                        tasks = [process_channel(session, sem, ch) for ch in channels if isinstance(ch, dict)]
                         if tasks:
                             await asyncio.gather(*tasks)
             except Exception as e:
                 logging.warning(f"Error reading Hub channels: {e}")
 
             elapsed = time.monotonic() - start_loop
-            sleep_time = max(0.1, POLL_INTERVAL - elapsed)
-            await asyncio.sleep(sleep_time)
+            await asyncio.sleep(max(0.1, POLL_INTERVAL - elapsed))
 
 if __name__ == "__main__":
     asyncio.run(main())
